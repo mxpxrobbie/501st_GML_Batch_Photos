@@ -1,379 +1,507 @@
 import os
-import re
+import sys
+import warnings
+import logging
 import zipfile
-import builtins
 from pathlib import Path
-from PIL import Image, ImageOps
-from rembg import remove
-from psd_tools import PSDImage
-from tqdm import tqdm
-
-# Fix for pytoshop internal PackBits bug
-import packbits
-builtins.packbits = packbits
-
-# Layered PSD exporter library
+import cv2
 import numpy as np
-import pytoshop
-from pytoshop.user import nested_layers
+from PIL import Image, ImageOps, ImageDraw
 
-# ==========================================
-# CONFIGURATION & PATHS
-# ==========================================
+# ---------------------------------------------------------------------------
+# 1. Environment & Suppression Flags
+# ---------------------------------------------------------------------------
+
+# Enter your Hugging Face token here, inside the quotes. 
+os.environ["HF_TOKEN"] = "ENTER TOKEN HERE"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN_WARNING"] = "1"
+
+warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
+warnings.filterwarnings("ignore", message=".*cache-system uses symlinks.*")
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+
+from transformers import logging as tf_logging
+tf_logging.set_verbosity_error()
+from transformers import pipeline
+
+# Library imports
+try:
+    from psd_tools import PSDImage
+    HAS_PSD_TOOLS = True
+except ImportError:
+    HAS_PSD_TOOLS = False
+
+try:
+    import pytoshop
+    from pytoshop.user import nested_layers
+    from pytoshop.enums import ColorMode, BlendMode, Compression
+    HAS_PYTOSHOP = True
+except ImportError:
+    HAS_PYTOSHOP = False
+
+# ---------------------------------------------------------------------------
+# 2. Configuration & Base Paths
+# ---------------------------------------------------------------------------
 BASE_DIR = Path(r"Z:\501st")
-FRAMESETS_BASE_DIR = BASE_DIR / "501st Framesets"
+FRAMESETS_DIR = BASE_DIR / "501st Framesets"
+VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
-# Folders inside Z:\501st to skip when looking for member folders
-EXCLUDE_FOLDERS = {"501st Framesets", "complete", "templates", "temp"}
+# ---------------------------------------------------------------------------
+# 3. Pose Safety Scanner (CLIP)
+# ---------------------------------------------------------------------------
+POSE_CLASSIFIER = None
 
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
-
-def extract_costume_prefix(folder_name: str) -> str:
-    """Extracts leading letters from a member folder name (e.g., 'TK8231' -> 'TK')."""
-    match = re.match(r"^([a-zA-Z]+)", folder_name.strip())
-    if match:
-        return match.group(1).upper()
-    raise ValueError(f"Could not extract costume prefix from folder name: '{folder_name}'")
-
-
-def find_frameset_folder(prefix: str) -> Path:
-    """Finds the subfolder inside '501st Framesets' matching the costume prefix."""
-    if not FRAMESETS_BASE_DIR.exists():
-        raise FileNotFoundError(f"Framesets base directory not found at {FRAMESETS_BASE_DIR}")
-
-    for subfolder in FRAMESETS_BASE_DIR.iterdir():
-        if subfolder.is_dir():
-            if subfolder.name.upper().startswith(prefix) or subfolder.name.upper() == prefix:
-                return subfolder
-
-    raise FileNotFoundError(
-        f"No frameset folder found in '{FRAMESETS_BASE_DIR}' matching prefix '{prefix}'"
-    )
-
-
-def get_frameset_psd(frameset_dir: Path, image_type: str) -> Path:
-    """Recursively searches inside frameset folder for PSD ending with '_{image_type}.psd'."""
-    matches = list(frameset_dir.rglob(f"*_{image_type}.psd"))
-    if not matches:
-        raise FileNotFoundError(
-            f"Could not find *_{image_type}.psd inside {frameset_dir} or any of its subfolders."
+def get_pose_classifier():
+    global POSE_CLASSIFIER
+    if POSE_CLASSIFIER is None:
+        POSE_CLASSIFIER = pipeline(
+            "zero-shot-image-classification",
+            model="openai/clip-vit-base-patch16"
         )
-    return matches[0]
+    return POSE_CLASSIFIER
 
+def check_unapproved_pose(image_path: Path, confidence_threshold: float = 0.30) -> tuple[bool, str]:
+    classifier = get_pose_classifier()
+    
+    unapproved_labels = [
+        "a photo of a person pointing a blaster or gun directly at the camera lens",
+        "aiming a weapon or prop forward at the viewer or camera",
+        "a gun barrel or blaster muzzle pointed at the lens"
+    ]
+    approved_labels = [
+        "a photo of a person holding a weapon pointed down at the floor",
+        "a person standing at ease holding a prop to the side",
+        "a holstered weapon or standing at attention"
+    ]
+    
+    if "action" in image_path.name.lower():
+        confidence_threshold = 0.20
 
-def load_psd_layers(psd_path: Path):
-    """Extracts Background (Layer 0) and Frame Overlay (Layers 1+) from a PSD file."""
-    psd = PSDImage.open(psd_path)
-    
-    bg_layer = psd[0].topil().convert("RGBA")
-    frame_overlay = Image.new("RGBA", psd.size, (0, 0, 0, 0))
-    
-    for layer in psd[1:]:
-        if getattr(layer, "visible", True):
-            layer_img = layer.topil()
-            if layer_img:
-                layer_img = layer_img.convert("RGBA")
-                frame_overlay.paste(layer_img, (layer.left, layer.top), layer_img)
+    try:
+        results = classifier(str(image_path), candidate_labels=unapproved_labels + approved_labels)
+        top_label = results[0]["label"]
+        unapproved_score = sum(r["score"] for r in results if r["label"] in unapproved_labels)
+        
+        print(f"    [Pose Check] {image_path.name}: Top Match = '{top_label[:45]}...' | Unapproved Score = {unapproved_score:.2%}")
+        
+        if top_label in unapproved_labels or unapproved_score >= confidence_threshold:
+            return True, f"Unapproved action pose (weapon pointed at camera, score: {unapproved_score:.1%})"
             
-    return bg_layer, frame_overlay
+    except Exception as e:
+        print(f"    [Warning] Pose safety check error for {image_path.name}: {e}")
+        
+    return False, ""
 
+# ---------------------------------------------------------------------------
+# 4. Smart Content Cropping Helpers & Background Removal Engine
+# ---------------------------------------------------------------------------
+REMBG_SESSION = None
+
+def get_rembg_session():
+    global REMBG_SESSION
+    if REMBG_SESSION is None:
+        try:
+            from rembg import new_session
+            REMBG_SESSION = new_session("birefnet-general")
+        except Exception:
+            try:
+                from rembg import new_session
+                REMBG_SESSION = new_session("u2net")
+            except Exception:
+                REMBG_SESSION = None
+    return REMBG_SESSION
+
+def cleanup_isolated_artifacts(rgba_img: Image.Image) -> Image.Image:
+    np_img = np.array(rgba_img)
+    if np_img.shape[2] < 4:
+        return rgba_img
+
+    alpha = np_img[:, :, 3]
+    _, binary_mask = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    cleaned_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        main_contour = max(contours, key=cv2.contourArea)
+        main_mask = np.zeros_like(cleaned_mask)
+        cv2.drawContours(main_mask, [main_contour], -1, 255, thickness=cv2.FILLED)
+        np_img[:, :, 3] = cv2.bitwise_and(alpha, main_mask)
+
+    return Image.fromarray(np_img)
 
 def remove_background(image_path: Path) -> Image.Image:
-    """Strips background from input photo using AI segmentation."""
-    with open(image_path, "rb") as f:
-        input_data = f.read()
-    output_data = remove(input_data)
-    from io import BytesIO
-    return Image.open(BytesIO(output_data)).convert("RGBA")
-
-
-def get_head_center_x(subject_img: Image.Image) -> float:
-    """
-    Calculates horizontal center X-coordinate of the head/face region 
-    (top 35% of subject cutout) to ensure precise centering.
-    """
-    bbox = subject_img.getbbox()
-    if not bbox:
-        return subject_img.width / 2.0
+    input_img = Image.open(image_path)
+    try:
+        from rembg import remove
+        session = get_rembg_session()
         
-    left, top, right, bottom = bbox
-    head_region_height = max(int((bottom - top) * 0.35), 10)
-    
-    head_crop = subject_img.crop((left, top, right, top + head_region_height))
-    head_bbox = head_crop.getbbox()
-    
-    if head_bbox:
-        return left + (head_bbox[0] + head_bbox[2]) / 2.0
-        
-    return (left + right) / 2.0
-
-
-def crop_waist_up(subject_img: Image.Image, height_ratio: float = 0.52) -> Image.Image:
-    """Crops transparent RGBA subject from top of head to waist (~52% down)."""
-    bbox = subject_img.getbbox()
-    if not bbox:
-        return subject_img
-        
-    left, top, right, bottom = bbox
-    subject_width = right - left
-    subject_height = bottom - top
-    
-    if subject_height / max(subject_width, 1) > 1.4:
-        waist_bottom = top + int(subject_height * height_ratio)
-        return subject_img.crop((left, top, right, waist_bottom))
-        
-    return subject_img.crop((left, top, right, bottom))
-
-
-def crop_bust_shot(subject_img: Image.Image, height_ratio: float = 0.35) -> Image.Image:
-    """Crops transparent RGBA subject to a bust view (chest/shoulders to top of head)."""
-    bbox = subject_img.getbbox()
-    if not bbox:
-        return subject_img
-        
-    left, top, right, bottom = bbox
-    subject_width = right - left
-    subject_height = bottom - top
-    
-    if subject_height / max(subject_width, 1) > 1.4:
-        bust_bottom = top + int(subject_height * height_ratio)
-        return subject_img.crop((left, top, right, bust_bottom))
-        
-    return subject_img.crop((left, top, right, bottom))
-
-
-def composite_photo(subject_img: Image.Image, bg_img: Image.Image, frame_overlay: Image.Image, fit_mode: str = "waist"):
-    """
-    Composites subject onto background and frame overlay.
-    Uses head-center alignment to keep face dead-centered in frame.
-    """
-    canvas = bg_img.copy().convert("RGBA")
-    
-    if fit_mode == "head":
-        # Target 88% of canvas height to fill frame window
-        target_h = int(canvas.height * 0.88)
-        h_ratio = target_h / max(subject_img.height, 1)
-        
-        new_h = target_h
-        new_w = int(subject_img.width * h_ratio)
-        
-        subject_resized = subject_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        bottom_margin = int(canvas.height * 0.02) # 2% margin at bottom frame border
-        
-    else: # 'waist' mode for Full/Thumb photos
-        target_w = int(canvas.width * 0.85)
-        w_ratio = target_w / max(subject_img.width, 1)
-        new_w = target_w
-        new_h = int(subject_img.height * w_ratio)
-        
-        max_h = int(canvas.height * 0.80)
-        if new_h > max_h:
-            h_ratio = max_h / new_h
-            new_h = max_h
-            new_w = int(new_w * h_ratio)
-            
-        subject_resized = subject_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        bottom_margin = int(canvas.height * 0.05)
-        
-    # Align specifically by the head center rather than bounding box edge
-    head_center_x = get_head_center_x(subject_resized)
-    x_offset = int((canvas.width / 2.0) - head_center_x)
-    y_offset = canvas.height - subject_resized.height - bottom_margin
-        
-    canvas.paste(subject_resized, (x_offset, y_offset), subject_resized)
-    canvas.paste(frame_overlay, (0, 0), frame_overlay)
-    
-    return canvas, subject_resized, (x_offset, y_offset)
-
-
-def save_layered_psd(bg_img: Image.Image, subject_img: Image.Image, frame_overlay: Image.Image, subject_offset: tuple, out_path: Path):
-    """
-    Saves an editable 3-layer Photoshop PSD file.
-    Layer Order (Top to Bottom): Frame Overlay -> Trooper Photo -> Background
-    """
-    width, height = bg_img.size
-
-    subject_canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    subject_canvas.paste(subject_img, subject_offset, subject_img)
-
-    def pil_to_psd_layer(pil_img: Image.Image, name: str):
-        arr = np.array(pil_img.convert("RGBA"))
-        channels = {
-            0: arr[:, :, 0],   # Red
-            1: arr[:, :, 1],   # Green
-            2: arr[:, :, 2],   # Blue
-            -1: arr[:, :, 3]   # Alpha
-        }
-        return nested_layers.Image(channels=channels, name=name)
-
-    layer_bg = pil_to_psd_layer(bg_img, "Background")
-    layer_subject = pil_to_psd_layer(subject_canvas, "Trooper Photo")
-    layer_frame = pil_to_psd_layer(frame_overlay, "Frame Overlay")
-
-    psd_layers = [layer_frame, layer_subject, layer_bg]
-    psd_file = nested_layers.nested_layers_to_psd(psd_layers, color_mode=pytoshop.enums.ColorMode.rgb)
-
-    with open(out_path, "wb") as f:
-        psd_file.write(f)
-
-
-def save_optimized_jpg(img: Image.Image, out_path: Path, min_kb: int, max_kb: int):
-    """Saves progressive JPG with quality auto-tuning starting from 95% downward."""
-    rgb_img = img.convert("RGB")
-    
-    for quality in range(95, 25, -5):
-        rgb_img.save(out_path, "JPEG", quality=quality, progressive=True)
-        size_kb = out_path.stat().st_size / 1024
-        if min_kb <= size_kb <= max_kb:
-            return
-        
-    rgb_img.save(out_path, "JPEG", quality=95, progressive=True)
-
-
-def save_optimized_gif(img: Image.Image, out_path: Path, colors: int = 64):
-    """Saves interlaced GIF thumbnail with color quantization."""
-    gif_img = img.convert("RGB").quantize(colors=colors, dither=Image.Dither.NONE)
-    gif_img.save(out_path, "GIF", interlace=True)
-
-
-def classify_photos(photo_paths: list[Path]):
-    """Categorizes member photos into (full, head, thumb)."""
-    full, head, thumb = None, None, None
-    remaining = []
-
-    for p in photo_paths:
-        name = p.stem.lower()
-        if "full" in name or "body" in name:
-            full = p
-        elif "head" in name or "face" in name or "helmet" in name or "bucket" in name or "off" in name:
-            head = p
-        elif "thumb" in name or "small" in name:
-            thumb = p
+        if session is not None:
+            raw_cutout = remove(
+                input_img,
+                session=session,
+                alpha_matting=False
+            )
         else:
-            remaining.append(p)
+            raw_cutout = remove(input_img, alpha_matting=False)
 
-    if not full and remaining:
-        full = remaining.pop(0)
-    if not head and remaining:
-        head = remaining.pop(0)
-    if not thumb and remaining:
-        thumb = remaining.pop(0)
+        return cleanup_isolated_artifacts(raw_cutout)
 
-    if not thumb:
-        thumb = full
+    except Exception:
+        return input_img.convert("RGBA")
 
-    return full, head, thumb
+def trim_transparent_padding(img: Image.Image) -> Image.Image:
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    bbox = img.getbbox()
+    return img.crop(bbox) if bbox else img
 
-# ==========================================
-# MAIN BATCH PROCESSOR
-# ==========================================
+def create_waist_up_crop(img: Image.Image) -> Image.Image:
+    trimmed = trim_transparent_padding(img)
+    w, h = trimmed.size
+    cropped = trimmed.crop((0, 0, w, int(h * 0.55)))
+    return trim_transparent_padding(cropped)
 
-def process_member_folder(member_dir: Path):
-    complete_dir = member_dir / "complete"
+def create_shoulders_up_crop(img: Image.Image) -> Image.Image:
+    trimmed = trim_transparent_padding(img)
+    w, h = trimmed.size
+    cropped = trimmed.crop((0, 0, w, int(h * 0.50)))
+    return trim_transparent_padding(cropped)
+
+def get_head_center_x(img_rgba: Image.Image) -> int:
+    np_img = np.array(img_rgba)
+    if np_img.shape[2] < 4:
+        return img_rgba.width // 2
+        
+    alpha = np_img[:, :, 3]
+    h, w = alpha.shape
+    head_region = alpha[:int(h * 0.4), :]
     
-    if complete_dir.exists():
-        print(f"\nSkipping [{member_dir.name}]: 'complete' folder already exists.")
+    cols_with_alpha = np.where(head_region > 25)[1]
+    if len(cols_with_alpha) > 0:
+        return int(np.mean(cols_with_alpha))
+    return w // 2
+
+def categorize_member_photos(approved_images: list[Path]) -> tuple[Path | None, Path | None]:
+    if not approved_images:
+        return None, None
+        
+    head_keywords = ["helmet off", "helmetoff", "bucket off", "bucketoff", "headshot", "no helmet", "no-helmet", "no bucket", "face"]
+    front_keywords = ["front", "full", "standing", "body", "main", "costume"]
+    
+    head_photo, front_photo = None, None
+    
+    for img in approved_images:
+        name_lower = img.name.lower()
+        if any(k in name_lower for k in head_keywords):
+            head_photo = img
+            break
+            
+    for img in approved_images:
+        name_lower = img.name.lower()
+        if any(k in name_lower for k in front_keywords):
+            front_photo = img
+            break
+            
+    if front_photo is None:
+        for img in approved_images:
+            if img != head_photo:
+                front_photo = img
+                break
+                
+    if front_photo is None:
+        front_photo = approved_images[0]
+        
+    if head_photo is None:
+        head_photo = front_photo
+        
+    return front_photo, head_photo
+
+def get_member_id(folder_name: str) -> str:
+    return folder_name.replace("-", "").replace(" ", "").lower()
+
+def get_costume_prefix(folder_name: str) -> str:
+    cleaned = folder_name.replace("-", "").strip()
+    prefix = "".join([c for c in cleaned if c.isalpha()])
+    return prefix.upper() if prefix else "TK"
+
+# ---------------------------------------------------------------------------
+# 5. Frameset & Overlay Engine
+# ---------------------------------------------------------------------------
+def find_frameset_template(view_type: str, costume_prefix: str = "") -> Path | None:
+    if not FRAMESETS_DIR.exists():
+        return None
+        
+    psd_files = [p for p in FRAMESETS_DIR.rglob("*") if p.suffix.lower() == ".psd"]
+    if not psd_files:
+        return None
+        
+    for psd in psd_files:
+        name = psd.name.lower()
+        if costume_prefix.lower() in name and view_type.lower() in name:
+            return psd
+            
+    for psd in psd_files:
+        if view_type.lower() in psd.name.lower():
+            return psd
+            
+    return psd_files[0]
+
+def generate_procedural_frame(width: int, height: int) -> tuple[Image.Image, Image.Image]:
+    bg = Image.new("RGBA", (width, height), (25, 30, 36, 255))
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    
+    bw = int(min(width, height) * 0.04)
+    draw.rectangle([0, 0, width, height], outline=(192, 196, 200, 255), width=bw)
+    draw.rectangle([bw + 2, bw + 2, width - bw - 2, height - bw - 2], outline=(120, 125, 130, 255), width=2)
+    
+    return bg, overlay
+
+def load_frameset_layers(template_path: Path | None, target_w: int = 1000, target_h: int = 1500):
+    if template_path and template_path.exists() and HAS_PSD_TOOLS:
+        try:
+            psd = PSDImage.open(template_path)
+            w, h = psd.width, psd.height
+            layers = [l for l in psd.descendants() if l.is_visible() and not l.is_group()]
+            
+            overlay_img, bg_img = None, None
+            for l in layers:
+                name = l.name.lower()
+                if any(k in name for k in ["frame", "overlay", "border", "top", "501st"]):
+                    overlay_img = l.topil()
+                elif any(k in name for k in ["bg", "background", "back", "bottom", "paper"]):
+                    bg_img = l.topil()
+                    
+            if overlay_img is None and len(layers) > 0:
+                overlay_img = layers[0].topil()
+            if bg_img is None and len(layers) > 0:
+                bg_img = layers[-1].topil()
+                
+            bg_rgba = bg_img.convert("RGBA").resize((w, h)) if bg_img else Image.new("RGBA", (w, h), (30, 34, 40, 255))
+            overlay_rgba = overlay_img.convert("RGBA").resize((w, h)) if overlay_img else Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            return bg_rgba, overlay_rgba, w, h
+        except Exception as e:
+            print(f"    [Frameset] Notice reading template ({e}). Using metallic fallback.")
+
+    return generate_procedural_frame(target_w, target_h) + (target_w, target_h)
+
+# ---------------------------------------------------------------------------
+# 6. Uncompressed 3-Layer PSD Writer
+# ---------------------------------------------------------------------------
+def write_3layer_psd(bg_img: Image.Image, trooper_img: Image.Image, overlay_img: Image.Image, output_psd_path: Path, layer_offset=(0, 0)):
+    w, h = overlay_img.size
+    bg_rgba = bg_img.convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
+    overlay_rgba = overlay_img.convert("RGBA").resize((w, h), Image.Resampling.LANCZOS)
+    trooper_rgba = trooper_img.convert("RGBA")
+
+    off_x, off_y = layer_offset
+
+    if HAS_PYTOSHOP:
+        try:
+            def build_layer(img, name, top=0, left=0):
+                r, g, b, a = img.split()
+                channels = {
+                    -1: np.array(a, dtype=np.uint8),
+                     0: np.array(r, dtype=np.uint8),
+                     1: np.array(g, dtype=np.uint8),
+                     2: np.array(b, dtype=np.uint8)
+                }
+                return nested_layers.Image(
+                    name=name,
+                    visible=True,
+                    opacity=255,
+                    group_id=0,
+                    blend_mode=BlendMode.normal,
+                    channels=channels,
+                    top=top,
+                    left=left
+                )
+
+            layer_top = build_layer(overlay_rgba, "Frame Overlay", top=0, left=0)
+            layer_mid = build_layer(trooper_rgba, "Trooper Photo", top=off_y, left=off_x)
+            layer_bot = build_layer(bg_rgba, "Background", top=0, left=0)
+
+            psd_structure = nested_layers.nested_layers_to_psd(
+                [layer_top, layer_mid, layer_bot],
+                color_mode=ColorMode.rgb,
+                compression=Compression.raw
+            )
+            with open(output_psd_path, "wb") as f:
+                psd_structure.write(f)
+            return
+        except Exception as e:
+            print(f"    [PSD Export Error] {e}")
+
+# ---------------------------------------------------------------------------
+# 7. Asset Generator
+# ---------------------------------------------------------------------------
+def generate_member_assets(member_folder: Path, front_photo: Path, head_photo: Path):
+    complete_dir = member_folder / "complete"
+    complete_dir.mkdir(parents=True, exist_ok=True)
+    
+    member_id = get_member_id(member_folder.name)
+    costume_prefix = get_costume_prefix(member_folder.name)
+    
+    print(f"  -> Processing 501st Framed Package for: {member_id} ({costume_prefix})")
+
+    processed_front = remove_background(front_photo)
+    processed_head = remove_background(head_photo)
+    
+    full_crop = create_waist_up_crop(processed_front)
+    thumb_crop = create_waist_up_crop(processed_front)
+    head_crop = create_shoulders_up_crop(processed_head)
+
+    # Deliverable paths
+    full_jpg = complete_dir / f"{member_id}_full.jpg"
+    full_psd = complete_dir / f"{member_id}_full_working.psd"
+    head_jpg = complete_dir / f"{member_id}_head.jpg"
+    head_psd = complete_dir / f"{member_id}_head_working.psd"
+    thumb_gif = complete_dir / f"{member_id}_thumb.gif"
+    thumb_psd = complete_dir / f"{member_id}_thumb_working.psd"
+    zip_path = complete_dir / f"{member_id}.zip"
+
+    # Templates
+    full_template = find_frameset_template("full", costume_prefix)
+    head_template = find_frameset_template("head", costume_prefix)
+    thumb_template = find_frameset_template("thumb", costume_prefix)
+
+    def build_view(view_type, source_cutout, template, jpg_path, psd_path, is_gif=False):
+        bg, overlay, w, h = load_frameset_layers(template)
+        
+        if view_type == "head":
+            top_margin = int(h * 0.10)
+            target_h = h - top_margin
+            aspect = source_cutout.width / source_cutout.height
+            target_w = int(target_h * aspect)
+            
+            fit_trooper = source_cutout.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            
+            head_x = get_head_center_x(fit_trooper)
+            off_x = (w // 2) - head_x
+            off_y = top_margin
+
+            trooper_canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            trooper_canvas.paste(fit_trooper, (off_x, off_y), fit_trooper)
+            
+            merged = Image.alpha_composite(Image.alpha_composite(bg, trooper_canvas), overlay).convert("RGB")
+            write_3layer_psd(bg, fit_trooper, overlay, psd_path, layer_offset=(off_x, off_y))
+        else:
+            if view_type == "full":
+                top_margin = int(h * 0.16)
+                bottom_margin = int(h * 0.08)
+                avail_w = int(w * 0.82)
+            else: # thumb
+                top_margin = int(h * 0.14)
+                bottom_margin = int(h * 0.06)
+                avail_w = int(w * 0.84)
+
+            avail_h = h - top_margin - bottom_margin
+            fit_trooper = ImageOps.contain(source_cutout.convert("RGBA"), (avail_w, avail_h), Image.Resampling.LANCZOS)
+            
+            head_x = get_head_center_x(fit_trooper)
+            off_x = (w // 2) - head_x
+            off_y = (h - bottom_margin) - fit_trooper.height
+
+            trooper_canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            trooper_canvas.paste(fit_trooper, (off_x, off_y), fit_trooper)
+            
+            merged = Image.alpha_composite(Image.alpha_composite(bg, trooper_canvas), overlay).convert("RGB")
+            write_3layer_psd(bg, trooper_canvas, overlay, psd_path, layer_offset=(0, 0))
+        
+        if is_gif:
+            merged.quantize(colors=256).save(jpg_path, "GIF", interlace=False)
+        else:
+            merged.save(jpg_path, "JPEG", quality=100, subsampling=0)
+
+    # 1. Full View
+    build_view("full", full_crop, full_template, full_jpg, full_psd)
+    
+    # 2. Headshot View
+    build_view("head", head_crop, head_template, head_jpg, head_psd)
+    
+    # 3. Thumbnail View
+    build_view("thumb", thumb_crop, thumb_template, thumb_gif, thumb_psd, is_gif=True)
+
+    # 4. Final ZIP Package
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for f in [full_jpg, head_jpg, thumb_gif]:
+            if f.exists():
+                zipf.write(f, arcname=f.name)
+
+    print(f"  -> Generated 7 framed deliverables in {complete_dir.relative_to(BASE_DIR)}")
+
+# ---------------------------------------------------------------------------
+# 8. Main Loop
+# ---------------------------------------------------------------------------
+def process_501st_batch(base_directory: Path = BASE_DIR):
+    if not base_directory.exists():
+        print(f"Error: Base directory '{base_directory}' not found.")
         return
 
-    member_id = member_dir.name.lower().strip() # e.g. tk8231
-    prefix = extract_costume_prefix(member_dir.name)
-    frameset_dir = find_frameset_folder(prefix)
+    print(f"=== Starting 501st Member Photo Batch Processing ===")
+    print(f"Base Directory: {base_directory}\n")
 
-    valid_extensions = {".jpg", ".jpeg", ".png", ".webp", ".tif"}
-    raw_photos = [
-        p for p in member_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in valid_extensions
-    ]
+    summary_report = []
+    member_folders = [f for f in base_directory.iterdir() if f.is_dir() and f.name != "501st Framesets"]
 
-    if not raw_photos:
-        return
-
-    print(f"\nProcessing Member Folder: [{member_dir.name}] (Prefix: '{prefix}')")
-
-    full_src, head_src, thumb_src = classify_photos(raw_photos)
-
-    with tqdm(total=8, desc=f"  {member_id.upper()}", unit="step", bar_format="{desc}: |{bar:30}| {percentage:3.0f}% [{postfix}]") as pbar:
+    for folder in member_folders:
+        complete_dir = folder / "complete"
+        member_id = get_member_id(folder.name)
+        expected_zip = complete_dir / f"{member_id}.zip"
         
-        complete_dir.mkdir(exist_ok=True)
+        if complete_dir.exists() and not expected_zip.exists():
+            for stale_file in complete_dir.iterdir():
+                try:
+                    if stale_file.is_file():
+                        stale_file.unlink()
+                except Exception:
+                    pass
 
-        # Step 1: Process FULL - BG Removal & Waist-Up Crop
-        pbar.set_postfix_str("1/8 AI BG Removal & Waist-Up Crop (FULL)")
-        full_psd_path = get_frameset_psd(frameset_dir, "full")
-        bg_full, overlay_full = load_psd_layers(full_psd_path)
-        
-        full_no_bg = remove_background(full_src)
-        full_waist_up = crop_waist_up(full_no_bg, height_ratio=0.52)
-        pbar.update(1)
+        if expected_zip.exists():
+            print(f"[SKIP] {folder.name}: Package ({expected_zip.name}) is complete.")
+            continue
 
-        # Step 2: Process FULL - Composite & Save (Waist Fit)
-        pbar.set_postfix_str("2/8 Compositing FULL JPG & PSD")
-        full_comp, full_subj_resized, full_offset = composite_photo(full_waist_up, bg_full, overlay_full, fit_mode="waist")
-        full_out = complete_dir / f"{member_id}_full.jpg"
-        save_optimized_jpg(full_comp, full_out, min_kb=20, max_kb=50)
-        full_psd_out = complete_dir / f"{member_id}_full_working.psd"
-        save_layered_psd(bg_full, full_subj_resized, overlay_full, full_offset, full_psd_out)
-        pbar.update(1)
+        images = [p for p in folder.iterdir() if p.suffix.lower() in VALID_EXTENSIONS]
+        if not images:
+            continue
 
-        # Step 3: Process HEAD - BG Removal & Bust Crop
-        pbar.set_postfix_str("3/8 AI BG Removal & Bust Crop (HEAD)")
-        head_psd_path = get_frameset_psd(frameset_dir, "head")
-        bg_head, overlay_head = load_psd_layers(head_psd_path)
-        
-        head_no_bg = remove_background(head_src)
-        head_bust = crop_bust_shot(head_no_bg, height_ratio=0.35)
-        pbar.update(1)
+        print(f"\n[PROCESSING] Member Folder: {folder.name}")
 
-        # Step 4: Process HEAD - Composite & Save (Head Fill Fit)
-        pbar.set_postfix_str("4/8 Compositing HEAD JPG & PSD")
-        head_comp, head_subj_resized, head_offset = composite_photo(head_bust, bg_head, overlay_head, fit_mode="head")
-        head_out = complete_dir / f"{member_id}_head.jpg"
-        save_optimized_jpg(head_comp, head_out, min_kb=10, max_kb=40)
-        head_psd_out = complete_dir / f"{member_id}_head_working.psd"
-        save_layered_psd(bg_head, head_subj_resized, overlay_head, head_offset, head_psd_out)
-        pbar.update(1)
+        approved_images = []
+        for img_path in images:
+            is_unapproved, reason = check_unapproved_pose(img_path)
+            if is_unapproved:
+                print(f"  --> [FLAGGED]: {reason}")
+                summary_report.append(f"{folder.name} / {img_path.name}: FLAGGED - {reason}")
+            else:
+                approved_images.append(img_path)
 
-        # Step 5: Process THUMB - Reuses Waist-Up Cutout
-        pbar.set_postfix_str("5/8 Preparing THUMB (Reusing Waist-Up Cutout)")
-        thumb_psd_path = get_frameset_psd(frameset_dir, "thumb")
-        bg_thumb, overlay_thumb = load_psd_layers(thumb_psd_path)
-        thumb_no_bg = full_waist_up
-        pbar.update(1)
+        if not approved_images:
+            print(f"  --> [SKIP] No approved images remaining in {folder.name}")
+            continue
 
-        # Step 6: Process THUMB - Composite & Save (Waist Fit)
-        pbar.set_postfix_str("6/8 Compositing THUMB GIF & PSD")
-        thumb_comp, thumb_subj_resized, thumb_offset = composite_photo(thumb_no_bg, bg_thumb, overlay_thumb, fit_mode="waist")
-        thumb_out = complete_dir / f"{member_id}_thumb.gif"
-        save_optimized_gif(thumb_comp, thumb_out, colors=64)
-        thumb_psd_out = complete_dir / f"{member_id}_thumb_working.psd"
-        save_layered_psd(bg_thumb, thumb_subj_resized, overlay_thumb, thumb_offset, thumb_psd_out)
-        pbar.update(1)
+        front_photo, head_photo = categorize_member_photos(approved_images)
+        if not front_photo:
+            print(f"  --> [ERROR] Could not determine front photo for {folder.name}")
+            continue
 
-        # Step 7: Package into ZIP Archive
-        pbar.set_postfix_str("7/8 Creating .ZIP Archive")
-        zip_out = complete_dir / f"{member_id}.zip"
-        with zipfile.ZipFile(zip_out, "w", zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(full_out, full_out.name)
-            zipf.write(head_out, head_out.name)
-            zipf.write(thumb_out, thumb_out.name)
-        pbar.update(1)
+        try:
+            generate_member_assets(folder, front_photo, head_photo)
+            summary_report.append(f"{folder.name}: SUCCESS (Full: {front_photo.name}, Head: {head_photo.name})")
+        except Exception as e:
+            print(f"  --> [ERROR] Processing failed: {e}")
+            summary_report.append(f"{folder.name}: ERROR - {e}")
 
-        # Step 8: Complete
-        pbar.set_postfix_str("8/8 Complete!")
-        pbar.update(1)
+    report_path = base_directory / "batch_run_report.txt"
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("501st Batch Processing Execution Summary\n")
+        f.write("========================================\n\n")
+        f.write("\n".join(summary_report))
 
-    print(f"  [SUCCESS] Completed {member_id.upper()} -> Output folder: {complete_dir}")
-
-
-def run_batch():
-    print(f"Scanning base directory: {BASE_DIR}\n")
-    for item in BASE_DIR.iterdir():
-        if item.is_dir() and item.name not in EXCLUDE_FOLDERS:
-            try:
-                process_member_folder(item)
-            except Exception as e:
-                print(f"  [ERROR] Skipping {item.name}: {e}")
+    print(f"\n=== Batch Execution Complete. Summary saved to {report_path.name} ===")
 
 if __name__ == "__main__":
-    run_batch()
+    process_501st_batch(BASE_DIR)

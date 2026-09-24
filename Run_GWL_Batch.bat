@@ -6,7 +6,7 @@ cd /d "%~dp0"
 
 :: Ensure all required libraries are installed
 echo Checking and installing required packages...
-python -m pip install --quiet pillow rembg psd-tools opencv-python onnxruntime pytoshop numpy six packbits tqdm
+python -m pip install --quiet pillow rembg psd-tools opencv-python onnxruntime pytoshop numpy six packbits tqdm transformers torch
 
 echo Running batch processor...
 echo ----------------------------------------------------
